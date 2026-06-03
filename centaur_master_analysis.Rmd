@@ -211,6 +211,16 @@ foxc1_df$pam50 <- factor(foxc1_df$pam50, levels=c("LumA","LumB","Her2","Basal"))
 rho_fc <- cor(foxc1_df$foxc1[foxc1_df$pam50=="LumA"],
               foxc1_df$foxcut[foxc1_df$pam50=="LumA"], method="spearman")
 
+# ---- Distribution descriptors cited in the text (LumA vs Basal FOXC1) ----
+lumA_log2  <- log2(foxc1_all[lumA_idx]  + 1)
+basal_log2 <- log2(foxc1_all[basal_idx] + 1)
+basal_decile1 <- quantile(basal_log2, 0.10, na.rm = TRUE)        # bottom decile of Basal
+pct_lumA_above <- 100 * mean(lumA_log2 >= basal_decile1, na.rm = TRUE)
+cat(sprintf("LumA  FOXC1 median log2 = %.2f\n",  median(lumA_log2,  na.rm = TRUE)))
+cat(sprintf("Basal FOXC1 median log2 = %.2f\n",  median(basal_log2, na.rm = TRUE)))
+cat(sprintf("Basal bottom-decile log2 = %.2f\n", basal_decile1))
+cat(sprintf("%% of LumA at/above Basal bottom decile = %.1f%%\n", pct_lumA_above))
+
 p1 <- ggplot(foxc1_df, aes(foxc1, fill=pam50)) +
   geom_density(alpha=0.4) +
   geom_vline(xintercept=CENTAUR_LOG2, linetype="dashed", color="red") +
@@ -403,6 +413,14 @@ imm$cat <- case_when(
   imm$gene %in% c("PDCD1","CD274","CTLA4","TIGIT","HAVCR2") ~ "Checkpoint",
   imm$gene %in% c("FOXP3","IL2RA") ~ "Treg",
   imm$gene %in% c("CXCL1","CCL2","CD68","ITGAM","CD163","MRC1") ~ "Myeloid", TRUE ~ "Other")
+
+# ---- Table: every immune-gene correlation the paper cites (Section 3) ----
+imm_tab <- imm[order(-imm$rho), c("gene","cat","rho","p","fdr")]
+imm_tab$gene <- as.character(imm_tab$gene)
+imm_tab$fdr  <- signif(imm_tab$fdr, 3)
+knitr::kable(imm_tab, row.names = FALSE,
+  caption = "FOXC1 \u00d7 immune-gene Spearman correlations in LumA (Section 3 panel; BH-corrected)")
+
 fig_immune <- ggplot(imm, aes(rho, gene, fill=cat)) + geom_col() + geom_vline(xintercept=0) +
   labs(title="FOXC1 × immune correlations in LumA", x="Spearman ρ", y=NULL, fill=NULL) +
   theme_bw(base_size=11)
@@ -429,6 +447,11 @@ for (sym in names(strom_ids)) {
     foxcut=round(ct2$estimate,3)))
 }
 strom <- strom[order(-strom$foxc1), ]
+
+# ---- Table: every stromal-gene correlation the paper cites (Section 4) ----
+knitr::kable(strom, row.names = FALSE,
+  caption = "FOXC1 and FOXCUT \u00d7 stromal-gene Spearman correlations in LumA (Section 4 panel)")
+
 fig_stromal <- strom %>% pivot_longer(c(foxc1,foxcut), names_to="src", values_to="rho") %>%
   ggplot(aes(rho, reorder(gene, rho), fill=src)) +
   geom_col(position=position_dodge(0.7), width=0.6) + geom_vline(xintercept=0) +
@@ -575,10 +598,9 @@ fig_prolif_box | fig_prolif_cor
 ```{r s6_prog, fig.height=4, fig.width=9}
 # LP_PANEL (6 genes) is defined globally and is the COMPOSITE used in mediation (prog_z).
 # Do NOT add genes to LP_PANEL here -- doing so would change the mediation HR in s7.
-# For reporting we ALSO correlate NES (nestin; positive progenitor marker cited in the
-# abstract) and the negative markers CD24/EPCAM/CD44 -- correlation only, NOT folded
-# into the composite.
-prog_pos <- c(LP_PANEL)            # positive markers reported (NES not in composite)
+# For reporting we ALSO correlate the negative markers CD24/EPCAM/CD44 -- correlation
+# only, NOT folded into the composite.
+prog_pos <- LP_PANEL                      # positive progenitor markers (validated panel)
 prog_neg <- c("CD24","EPCAM","CD44")      # negative markers, correlation only
 
 cor_one <- function(sym) {
@@ -593,7 +615,7 @@ prog$fdr <- signif(p.adjust(prog$p, "BH"), 3)
 prog <- prog[order(-prog$rho), ]
 
 # Output the table
-knitr::kable(prog, caption="FOXC1 × progenitor markers in LumA (BH-corrected; NES and the negative markers are reported but NOT in the mediation composite)")
+knitr::kable(prog, caption="FOXC1 × progenitor markers in LumA (BH-corrected; negative markers are reported but NOT in the mediation composite)")
 
 # Then the plot
 fig_prog <- ggplot(prog, aes(rho, reorder(gene, rho), fill=direction)) +
@@ -822,6 +844,21 @@ ortho$rho <- round(ortho$rho, 3)
 ortho$interpretation <- c(rep("Clinical tool (expect null)",4),
   rep("Poudel (expect overlap)",3), "By definition")
 knitr::kable(ortho, caption="FOXC1 orthogonality to LumA classification systems")
+```
+
+```{r s8_lineage_anchors}
+# Single-gene lineage anchors cited in the text (SCMGENE genes + ER axis).
+# Reproduces ESR1 rho (~ -0.43) and confirms ERBB2 is uninformative in LumA.
+anchor <- data.frame()
+for (sym in c("ESR1","PGR","ERBB2")) {
+  gid <- lookup_id(sym); if (is.na(gid)) next
+  ct <- cor.test(foxc1_lumA, as.numeric(norm_counts[gid, lumA_idx]),
+                 method = "spearman", exact = FALSE)
+  anchor <- rbind(anchor, data.frame(gene = sym,
+    rho = round(ct$estimate, 3), p = signif(ct$p.value, 3)))
+}
+knitr::kable(anchor, row.names = FALSE,
+  caption = "FOXC1 vs single-gene lineage anchors in LumA (ESR1 is the cited -0.43)")
 ```
 
 ```{r s8_plot, fig.height=5, fig.width=9}
