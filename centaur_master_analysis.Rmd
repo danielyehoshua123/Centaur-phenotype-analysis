@@ -297,8 +297,10 @@ arrange_ggsurvplots(
 ```{r s2_cox_genes}
 gene_cox <- function(df, gene, cohort) {
   df$grp <- df[[gene]]   # "<gene> low" is the reference level
+  m <- coxph(Surv(time, event) ~ grp, data = df)
+  # coefficient is named "grp<high level>" (e.g. "grpFOXC1 high"), not "groupCentaur"
   cbind(Gene = gene, Cohort = cohort,
-        extract_hr(coxph(Surv(time, event) ~ grp, data = df)))
+        extract_hr(m, paste0("grp", levels(df$grp)[2])))
 }
 rbind(
   gene_cox(surv_norad, "FOXCUT", "No-radiation"),
