@@ -44,6 +44,7 @@ library(patchwork)
 suppressWarnings({
   has_gsva    <- requireNamespace("GSVA", quietly = TRUE)
   has_diptest <- requireNamespace("diptest", quietly = TRUE)
+  has_mclust  <- requireNamespace("mclust", quietly = TRUE)
   has_seurat  <- requireNamespace("Seurat", quietly = TRUE)
 })
 ```
@@ -191,9 +192,10 @@ proliferation    <- c("MKI67","CCNB1","CCNB2","CCNA2","PLK1","AURKA","AURKB","TO
                        "CDC20","BUB1","BUB1B","CENPE","CENPF","TTK","CDK1","CCND1","MCM2","PCNA","RRM2")
 progenitor       <- LP_PANEL
 immune_panel     <- c("CD8A","CD8B","PRF1","GZMA","GZMB","NKG7","GNLY","IFNG","IL2",
-                       "CCL19","CCL21","CD79B","CD79A","MS4A1","CXCL9","CCL5",
-                       "PDCD1","CD274","CTLA4","TIGIT","HAVCR2","CXCL1","CCL2",
-                       "CD68","ITGAM","CXCL13","LAMP3","CCR7")
+                       "CCL19","CCL21","CD79B","CD79A","MS4A1","CD19","CXCL9","CCL5","CCL4",
+                       "PDCD1","CD274","CTLA4","TIGIT","HAVCR2","FOXP3","IL2RA",
+                       "CXCL1","CCL2","CD68","ITGAM","CD163","MRC1","TNF",
+                       "CXCL13","CR2","FCER2","LAMP3","CCR7")
 ```
 
 ---
@@ -225,6 +227,28 @@ p1 | p2
 table(group_df$group) %>% as.data.frame() %>% setNames(c("Group","N")) %>%
   mutate(Pct = round(100*N/sum(N),1)) %>%
   knitr::kable(caption = paste0("Group sizes (median split, log2=", CENTAUR_LOG2, ")"))
+```
+
+```{r s1_unimodality}
+# Modality of the FOXC1 distribution in LumA. Supports the continuous-gradient framing:
+# the median split is a convention, not a discovered boundary between two populations.
+fc <- log2(foxc1_lumA + 1); fc <- fc[is.finite(fc)]
+
+# Hartigan's dip test (H0: unimodal). p > 0.05 = fail to reject unimodality (weak, by itself).
+if (requireNamespace("diptest", quietly = TRUE)) {
+  dp <- diptest::dip.test(fc)
+  cat(sprintf("Hartigan's dip test: D = %.4f, p = %.3f\n", dp$statistic, dp$p.value))
+} else cat("diptest not installed.\n")
+
+# BIC: 1- vs 2-component Gaussian mixture. This gives POSITIVE evidence for unimodality
+# when the 1-component model wins (mclust BIC: higher = better fit).
+if (requireNamespace("mclust", quietly = TRUE)) {
+  bic <- mclust::mclustBIC(fc, G = 1:2, modelNames = "V")
+  cat("\nGaussian mixture BIC (modelName V; higher = better):\n"); print(bic)
+  b1 <- bic["1","V"]; b2 <- bic["2","V"]
+  cat(sprintf("\nΔBIC (G1 − G2) = %+.2f  →  %s favored\n",
+      b1 - b2, ifelse(b1 > b2, "1 component (unimodal)", "2 components (bimodal)")))
+} else cat("mclust not installed.\n")
 ```
 
 ---
@@ -313,6 +337,48 @@ cat("\nProportional hazards test:\n")
 print(cox.zph(coxph(Surv(time,event)~group, data=surv_norad_unc)))
 ```
 
+## Radiation × Genotype Interaction
+
+```{r s2_interaction}
+# Formal genotype × radiation interaction (paper cites interaction p < 0.01).
+# Pooled LumA cohort restricted to patients with known radiation status.
+surv_int <- surv_all[surv_all$radiation %in% c("yes","no"), ]
+surv_int <- add_gene_splits(surv_int)
+surv_int$radiation <- factor(surv_int$radiation, levels = c("no","yes"))
+surv_int$centaur   <- factor(ifelse(surv_int$group == "Centaur","Centaur","Non_centaur"),
+                             levels = c("Non_centaur","Centaur"))
+
+# Likelihood-ratio test on the interaction term (additive vs full model)
+int_test <- function(var) {
+  m_full <- coxph(as.formula(paste0("Surv(time,event) ~ ", var, " * radiation")), data = surv_int)
+  m_add  <- coxph(as.formula(paste0("Surv(time,event) ~ ", var, " + radiation")), data = surv_int)
+  lrt    <- anova(m_add, m_full)
+  data.frame(Predictor = var,
+             Interaction_p_LRT = signif(lrt[[ncol(lrt)]][2], 3))   # last col, 2nd row = p
+}
+rbind(int_test("FOXC1"), int_test("FOXCUT"), int_test("centaur")) %>%
+  knitr::kable(caption = "Likelihood-ratio test for genotype × radiation interaction (pooled LumA, known radiation status)")
+
+# Full FOXC1 × radiation model coefficients (source of the in-text stratum HRs)
+cat("\nFOXC1 × radiation interaction model:\n")
+print(summary(coxph(Surv(time,event) ~ FOXC1 * radiation, data = surv_int))$coefficients)
+```
+
+## Continuous (Non-Dichotomized) Cox
+
+```{r s2_continuous}
+# Continuous per-SD Cox in the radiation-naive cohort -- avoids the median split and
+# gives the more stable estimate referenced in the Limitations.
+surv_norad$foxc1_z  <- scale(log2(surv_norad$foxc1  + 1))[,1]
+surv_norad$foxcut_z <- scale(log2(surv_norad$foxcut + 1))[,1]
+rbind(
+  cbind(Gene = "FOXC1 (per SD, continuous)",
+        extract_hr(coxph(Surv(time,event) ~ foxc1_z,  data = surv_norad), "foxc1_z")),
+  cbind(Gene = "FOXCUT (per SD, continuous)",
+        extract_hr(coxph(Surv(time,event) ~ foxcut_z, data = surv_norad), "foxcut_z"))
+) %>% knitr::kable(caption = "Continuous per-SD Cox HR, radiation-naive (no dichotomization)")
+```
+
 ---
 
 # Immune Gene Correlations
@@ -330,9 +396,11 @@ imm$gene <- factor(imm$gene, levels=rev(imm$gene))
 imm$cat <- case_when(
   imm$gene %in% c("CCL19","CCL21","CXCL13") ~ "TLS",
   imm$gene %in% c("CD8A","CD8B","PRF1","GZMA","GZMB","NKG7","GNLY","IFNG","IL2") ~ "Cytotoxic",
-  imm$gene %in% c("CD79B","CD79A","MS4A1") ~ "B cell",
+  imm$gene %in% c("CD79B","CD79A","MS4A1","CD19") ~ "B cell",
+  imm$gene %in% c("CR2","FCER2") ~ "FDC",
   imm$gene %in% c("PDCD1","CD274","CTLA4","TIGIT","HAVCR2") ~ "Checkpoint",
-  imm$gene %in% c("CXCL1","CCL2","CD68","ITGAM") ~ "Myeloid", TRUE ~ "Other")
+  imm$gene %in% c("FOXP3","IL2RA") ~ "Treg",
+  imm$gene %in% c("CXCL1","CCL2","CD68","ITGAM","CD163","MRC1") ~ "Myeloid", TRUE ~ "Other")
 fig_immune <- ggplot(imm, aes(rho, gene, fill=cat)) + geom_col() + geom_vline(xintercept=0) +
   labs(title="FOXC1 × immune correlations in LumA", x="Spearman ρ", y=NULL, fill=NULL) +
   theme_bw(base_size=11)
@@ -344,9 +412,10 @@ fig_immune
 # Stromal Gene Correlations
 
 ```{r s4_stromal, fig.height=9, fig.width=10}
-stromal_panel <- c("ACKR1","SELP","SELE","VCAM1","ICAM1","PECAM1","CDH5","VWF","PLVAP",
+stromal_panel <- c("ACKR1","SELP","SELE","VCAM1","ICAM1","PECAM1","CDH5","TEK","VWF","PLVAP",
   "VEGFA","PDGFRA","ACTA2","PDGFRB","MMP2","COL1A1","COL1A2","COL3A1","MCAM","RGS5",
-  "PDPN","IL7","CXCL12","LUM","DCN","LTB","TNFSF13B","CR2","LAMP3","CCR7")
+  "PDPN","IL7","CXCL12","LUM","DCN","APOD","DES","LTB","LTA","LTBR",
+  "TNFSF13B","TNFSF13","CR2","LAMP3","CCR7")
 strom_ids <- get_ids(unique(stromal_panel))
 strom <- data.frame()
 for (sym in names(strom_ids)) {
@@ -502,26 +571,33 @@ fig_prolif_box | fig_prolif_cor
 ## Progenitor Markers
 
 ```{r s6_prog, fig.height=4, fig.width=9}
-# LP_PANEL defined globally in the helpers chunk
-prog_ids <- get_ids(LP_PANEL)
+# LP_PANEL (6 genes) is defined globally and is the COMPOSITE used in mediation (prog_z).
+# Do NOT add genes to LP_PANEL here -- doing so would change the mediation HR in s7.
+# For reporting we ALSO correlate NES (nestin; positive progenitor marker cited in the
+# abstract) and the negative markers CD24/EPCAM/CD44 -- correlation only, NOT folded
+# into the composite.
+prog_pos <- c(LP_PANEL)            # positive markers reported (NES not in composite)
+prog_neg <- c("CD24","EPCAM","CD44")      # negative markers, correlation only
 
-prog <- data.frame()
-for (sym in names(prog_ids)) {
-  ct <- cor.test(foxc1_lumA, as.numeric(norm_counts[prog_ids[sym], lumA_idx]),
+cor_one <- function(sym) {
+  gid <- lookup_id(sym); if (is.na(gid)) return(NULL)
+  ct <- cor.test(foxc1_lumA, as.numeric(norm_counts[gid, lumA_idx]),
                   method="spearman", exact=FALSE)
-  prog <- rbind(prog, data.frame(gene=sym, rho=round(ct$estimate,3),
-                                  p=signif(ct$p.value,3)))
+  data.frame(gene=sym, rho=round(ct$estimate,3), p=signif(ct$p.value,3))
 }
+prog <- do.call(rbind, lapply(c(prog_pos, prog_neg), cor_one))
+prog$direction <- ifelse(prog$gene %in% prog_neg, "negative", "positive")
 prog$fdr <- signif(p.adjust(prog$p, "BH"), 3)
 prog <- prog[order(-prog$rho), ]
 
 # Output the table
-knitr::kable(prog, caption="FOXC1 × luminal progenitor markers in LumA (BH-corrected)")
+knitr::kable(prog, caption="FOXC1 × progenitor markers in LumA (BH-corrected; NES and the negative markers are reported but NOT in the mediation composite)")
 
 # Then the plot
-fig_prog <- ggplot(prog, aes(rho, reorder(gene, rho))) + geom_col(fill="#2c3e50") +
-  geom_vline(xintercept=0) +
-  labs(title="Luminal progenitor markers vs FOXC1 in LumA", x="Spearman ρ", y=NULL) +
+fig_prog <- ggplot(prog, aes(rho, reorder(gene, rho), fill=direction)) +
+  geom_col() + geom_vline(xintercept=0) +
+  scale_fill_manual(values=c(positive="#2c3e50", negative="#c0392b")) +
+  labs(title="Progenitor markers vs FOXC1 in LumA", x="Spearman ρ", y=NULL, fill=NULL) +
   theme_bw(base_size=12)
 fig_prog
 ```
