@@ -1,0 +1,32 @@
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store
+
+# Large downloaded / processed data
+data/external/*
+data/processed/*
+results/rds/*.rds
+results/rds/*.RDS
+
+# Keep directory placeholders
+!data/external/.gitkeep
+!data/processed/.gitkeep
+!results/rds/.gitkeep
+
+# Temporary render / LaTeX files
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.tmp
+
+# R / knitr caches
+_cache/
+cache/
+*_cache/
+*_files/
+
+# Optional local files
+.env
