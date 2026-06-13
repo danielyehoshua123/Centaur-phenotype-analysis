@@ -4,8 +4,8 @@ subtitle: "All validations and tests, Sections 1–9"
 author: "Daniel E. Yehoshua"
 date: "`r Sys.Date()`"
 params:
-  repository_url: "https://github.com/USERNAME/REPOSITORY"
-  install_missing_packages: false
+  repository_url: "https://github.com/danielyehoshua123/Centaur-phenotype-analysis"
+  install_missing_packages: true
   download_tcga_if_missing: true
   build_xcell2_if_missing: true
   download_gse176078_if_missing: true
