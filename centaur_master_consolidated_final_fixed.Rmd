@@ -1,8 +1,24 @@
 ---
 title: "The Molecular Centaur — Complete Analysis"
-subtitle: "All validations and tests, Sections 1–9 (consolidated master; includes review fixes — see CHANGELOG)"
+subtitle: "All validations and tests, Sections 1–9"
 author: "Daniel E. Yehoshua"
 date: "`r Sys.Date()`"
+params:
+  repository_url: "https://github.com/USERNAME/REPOSITORY"
+  install_missing_packages: false
+  download_tcga_if_missing: true
+  build_xcell2_if_missing: true
+  download_gse176078_if_missing: true
+  build_gse176078_seurat_if_missing: true
+  gse176078_external_dir: "data/external/GSE176078"
+  seurat_object_path: "data/GSE176078_seurat.rds"
+  run_foxc1_motif_test: false
+  run_scrna_ccl19_test: false
+  foxc1_motif_min_score: "85%"
+  promoter_upstream_bp: 2000
+  promoter_downstream_bp: 200
+  motif_background_genes: 500
+  force_rebuild_cache: false
 output:
   html_document:
     toc: true
@@ -29,11 +45,52 @@ knitr::opts_chunk$set(
   fig.width = 11, fig.height = 7, fig.align = "center",
   dpi = 150, out.width = "100%")
 options(knitr.kable.NA = "")
+
+# This report is designed to be self-contained for repository use:
+# cached inputs are loaded when present; otherwise public TCGA-derived inputs
+# are downloaded/rebuilt when params$download_tcga_if_missing is TRUE.
 ```
 
 
 
 # Setup and Data Construction
+
+# Repository and Reproducibility
+
+This report is intended to be the executable analysis record for the manuscript.
+
+```{r repository_metadata}
+repo_url <- params$repository_url
+cat("Repository:", repo_url, "\n")
+cat("Generated:", as.character(Sys.time()), "\n")
+cat("R version:", R.version.string, "\n")
+```
+
+**Reproducibility policy.** The report first looks for cached RDS objects under `results/rds/`. If the required files are missing and `params$download_tcga_if_missing = TRUE`, it downloads and rebuilds the TCGA-BRCA expression, subtype, and clinical inputs. Expensive derived objects, including xCell2 scores, are cached after creation. The single-cell validation object path is controlled by `params$seurat_object_path`; if absent and `params$build_gse176078_seurat_if_missing = TRUE`, the report downloads GSE176078 supplementary files, reconstructs a Seurat object when a supported processed format is detected, standardizes the published annotation column into `celltype_subset`, normalizes the RNA assay if needed, and saves the result to `params$seurat_object_path`. Heavy exploratory mechanism tests (FOXC1 promoter motif scanning and single-cell FOXC1/CCL19 co-expression by cell type) are included but disabled by default; enable them with `params$run_foxc1_motif_test = TRUE` and/or `params$run_scrna_ccl19_test = TRUE` when the required dependencies and inputs are available.
+
+```{r package_bootstrap, include=FALSE}
+ensure_packages <- function(pkgs, bioc = FALSE) {
+  missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing) == 0) return(invisible(TRUE))
+  if (!isTRUE(params$install_missing_packages)) {
+    stop(
+      "Missing required package(s): ", paste(missing, collapse = ", "),
+      "\nInstall them manually, or knit with params$install_missing_packages = TRUE.",
+      call. = FALSE
+    )
+  }
+  if (bioc) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+    BiocManager::install(missing, ask = FALSE, update = FALSE)
+  } else {
+    install.packages(missing, repos = "https://cloud.r-project.org")
+  }
+  invisible(TRUE)
+}
+
+ensure_packages(c("tidyverse", "survival", "survminer", "pheatmap", "patchwork"), bioc = FALSE)
+ensure_packages(c("AnnotationDbi", "org.Hs.eg.db"), bioc = TRUE)
+```
 
 ```{r libraries}
 library(tidyverse)
@@ -44,15 +101,589 @@ library(org.Hs.eg.db)
 library(pheatmap)
 library(patchwork)
 suppressWarnings({
-  has_gsva    <- requireNamespace("GSVA", quietly = TRUE)
-  has_diptest <- requireNamespace("diptest", quietly = TRUE)
-  has_mclust  <- requireNamespace("mclust", quietly = TRUE)
-  has_seurat  <- requireNamespace("Seurat", quietly = TRUE)
+  has_gsva       <- requireNamespace("GSVA", quietly = TRUE)
+  has_diptest    <- requireNamespace("diptest", quietly = TRUE)
+  has_mclust     <- requireNamespace("mclust", quietly = TRUE)
+  has_seurat     <- requireNamespace("Seurat", quietly = TRUE)
+  has_xcell2     <- requireNamespace("xCell2", quietly = TRUE)
+  has_tcgabiolinks <- requireNamespace("TCGAbiolinks", quietly = TRUE)
 })
 ```
 
+```{r reproducible_input_cache}
+# ---- Directory layout used by the Git repository ----
+dir.create("data", recursive = TRUE, showWarnings = FALSE)
+dir.create("data/external", recursive = TRUE, showWarnings = FALSE)
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+dir.create("results", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/rds", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+
+core_rds <- c(
+  norm_counts = "results/rds/norm_counts.rds",
+  sample_meta = "results/rds/sample_meta.rds",
+  brca_clin   = "results/rds/brca_clin.rds"
+)
+
+optional_rds <- c(
+  full_counts      = "results/rds/full_counts.rds",
+  tpm_counts_tumor = "results/rds/tpm_counts_tumor.rds",
+  xcell2_scores    = "results/rds/xcell2_scores.rds"
+)
+
+standardize_tcga_barcode <- function(x, n = NULL) {
+  y <- toupper(gsub("\\.", "-", as.character(x)))
+  if (!is.null(n)) y <- substr(y, 1, n)
+  y
+}
+
+pick_first_existing <- function(x, candidates) {
+  hit <- candidates[candidates %in% names(x)]
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+build_tcga_brca_cache <- function() {
+  needed <- c("TCGAbiolinks", "SummarizedExperiment", "DESeq2")
+  missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing) > 0) {
+    if (isTRUE(params$install_missing_packages)) {
+      ensure_packages(missing, bioc = TRUE)
+    } else {
+      stop(
+        "TCGA cache is missing and these packages are required to rebuild it: ",
+        paste(missing, collapse = ", "),
+        "\nInstall them manually, or knit with params$install_missing_packages = TRUE.",
+        call. = FALSE
+      )
+    }
+  }
+
+  message("Downloading/rebuilding TCGA-BRCA STAR-count cache...")
+  query <- TCGAbiolinks::GDCquery(
+    project = "TCGA-BRCA",
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts",
+    sample.type = "Primary Tumor"
+  )
+  TCGAbiolinks::GDCdownload(query, method = "api", files.per.chunk = 50)
+  se <- TCGAbiolinks::GDCprepare(query)
+
+  assays_available <- names(SummarizedExperiment::assays(se))
+  count_assay <- intersect(c("unstranded", "raw_count", "counts"), assays_available)[1]
+  if (is.na(count_assay)) count_assay <- assays_available[1]
+  full_counts <- as.matrix(SummarizedExperiment::assay(se, count_assay))
+
+  # Defensive tumor filter; GDCquery already asked for Primary Tumor, but keep this explicit.
+  sample_barcodes <- colnames(full_counts)
+  tumor_keep <- substr(standardize_tcga_barcode(sample_barcodes), 14, 15) %in% c("01")
+  full_counts <- full_counts[, tumor_keep, drop = FALSE]
+  sample_barcodes <- colnames(full_counts)
+  storage.mode(full_counts) <- "integer"
+  saveRDS(full_counts, optional_rds[["full_counts"]])
+
+  dds <- DESeq2::DESeqDataSetFromMatrix(
+    countData = round(full_counts),
+    colData = data.frame(row.names = sample_barcodes),
+    design = ~ 1
+  )
+  dds <- DESeq2::estimateSizeFactors(dds)
+  norm_counts <- DESeq2::counts(dds, normalized = TRUE)
+  saveRDS(norm_counts, core_rds[["norm_counts"]])
+
+  # TPM matrix for xCell2. Prefer GDC-provided TPM when available.
+  tpm_assay <- intersect(c("tpm_unstranded", "TPM", "tpm"), assays_available)[1]
+  if (!is.na(tpm_assay)) {
+    tpm_counts_tumor <- as.matrix(SummarizedExperiment::assay(se, tpm_assay))[, sample_barcodes, drop = FALSE]
+  } else {
+    rd <- as.data.frame(SummarizedExperiment::rowData(se))
+    len_col <- intersect(c("gene_length", "length", "transcript_length"), names(rd))[1]
+    if (is.na(len_col)) {
+      warning("No TPM assay or gene-length column found; xCell2 rebuild will require a TPM matrix.")
+      tpm_counts_tumor <- NULL
+    } else {
+      gene_length_kb <- as.numeric(rd[[len_col]]) / 1000
+      gene_length_kb[!is.finite(gene_length_kb) | gene_length_kb <= 0] <- NA
+      rate <- full_counts / gene_length_kb
+      tpm_counts_tumor <- t(t(rate) / colSums(rate, na.rm = TRUE)) * 1e6
+      tpm_counts_tumor[!is.finite(tpm_counts_tumor)] <- 0
+    }
+  }
+  if (!is.null(tpm_counts_tumor)) saveRDS(tpm_counts_tumor, optional_rds[["tpm_counts_tumor"]])
+
+  # PAM50 subtype metadata.
+  subtype <- TCGAbiolinks::TCGAquery_subtype(tumor = "BRCA")
+  subtype <- as.data.frame(subtype)
+  patient_col <- pick_first_existing(subtype, c("patient", "Patient", "bcr_patient_barcode", "TCGA_patient_barcode", "barcode"))
+  if (is.na(patient_col)) {
+    patient_col <- names(subtype)[grepl("patient|barcode|submitter", names(subtype), ignore.case = TRUE)][1]
+  }
+  pam50_col <- pick_first_existing(subtype, c("BRCA_Subtype_PAM50", "PAM50", "Subtype_Selected", "subtype"))
+  if (is.na(pam50_col)) {
+    pam50_col <- names(subtype)[grepl("PAM50|Subtype", names(subtype), ignore.case = TRUE)][1]
+  }
+  if (is.na(patient_col) || is.na(pam50_col)) {
+    stop("Could not identify patient/PAM50 columns in TCGAquery_subtype('BRCA') output.", call. = FALSE)
+  }
+  subtype$patient <- standardize_tcga_barcode(subtype[[patient_col]], 12)
+  subtype$pam50_from_tcga <- as.character(subtype[[pam50_col]])
+  subtype <- subtype[!duplicated(subtype$patient), c("patient", "pam50_from_tcga")]
+
+  sample_meta_tumor <- data.frame(
+    barcode = sample_barcodes,
+    patient = standardize_tcga_barcode(sample_barcodes, 12),
+    stringsAsFactors = FALSE
+  )
+  sample_meta_tumor <- dplyr::left_join(sample_meta_tumor, subtype, by = "patient")
+  sample_meta_tumor$paper_BRCA_Subtype_PAM50 <- sample_meta_tumor$pam50_from_tcga
+  sample_meta_tumor$pam50_from_tcga <- NULL
+  saveRDS(sample_meta_tumor, core_rds[["sample_meta"]])
+
+  # Clinical metadata. Radiation field names have changed across GDC/TCGAbiolinks versions,
+  # so this block normalizes the most common variants into the field expected downstream.
+  brca.clin <- TCGAbiolinks::GDCquery_clinic(project = "TCGA-BRCA", type = "clinical")
+  brca.clin <- as.data.frame(brca.clin)
+  if (!"submitter_id" %in% names(brca.clin)) {
+    id_col <- pick_first_existing(brca.clin, c("bcr_patient_barcode", "case_submitter_id", "patient"))
+    if (!is.na(id_col)) brca.clin$submitter_id <- standardize_tcga_barcode(brca.clin[[id_col]], 12)
+  }
+  rad_col <- pick_first_existing(brca.clin, c(
+    "treatments_radiation_treatment_or_therapy",
+    "radiation_treatment_or_therapy",
+    "radiation_therapy",
+    "treatment_or_therapy"
+  ))
+  if (!is.na(rad_col)) {
+    brca.clin$treatments_radiation_treatment_or_therapy <- tolower(as.character(brca.clin[[rad_col]]))
+  } else {
+    warning("No radiation-treatment column detected in downloaded clinical table; radiation-stratified survival will require a cached brca_clin.rds with this field.")
+    brca.clin$treatments_radiation_treatment_or_therapy <- NA_character_
+  }
+  saveRDS(brca.clin, core_rds[["brca_clin"]])
+
+  message("TCGA cache complete:")
+  message("  norm_counts: ", core_rds[["norm_counts"]])
+  message("  sample_meta: ", core_rds[["sample_meta"]])
+  message("  brca_clin:   ", core_rds[["brca_clin"]])
+  invisible(TRUE)
+}
+
+build_xcell2_cache <- function() {
+  xf <- optional_rds[["xcell2_scores"]]
+  if (file.exists(xf) && !isTRUE(params$force_rebuild_cache)) {
+    message("Using cached xCell2 scores: ", xf)
+    return(invisible(TRUE))
+  }
+  if (!isTRUE(params$build_xcell2_if_missing)) {
+    message("xCell2 scores missing, but params$build_xcell2_if_missing is FALSE; skipping.")
+    return(invisible(FALSE))
+  }
+  if (!requireNamespace("xCell2", quietly = TRUE)) {
+    warning("Package xCell2 is not installed; skipping xCell2 rebuild. Install xCell2 and re-knit, or provide results/rds/xcell2_scores.rds.")
+    return(invisible(FALSE))
+  }
+  if (!file.exists(optional_rds[["tpm_counts_tumor"]])) {
+    warning("TPM matrix not found at ", optional_rds[["tpm_counts_tumor"]], "; cannot rebuild xCell2 scores.")
+    return(invisible(FALSE))
+  }
+  if (!requireNamespace("BiocParallel", quietly = TRUE)) {
+    if (isTRUE(params$install_missing_packages)) ensure_packages("BiocParallel", bioc = TRUE)
+    else warning("BiocParallel is missing; xCell2 will try to run without explicit SerialParam.")
+  }
+
+  message("Building xCell2 scores from TPM matrix...")
+  tpm_counts_tumor <- readRDS(optional_rds[["tpm_counts_tumor"]])
+  ens <- gsub("\\..*", "", rownames(tpm_counts_tumor))
+  gene_symbols <- AnnotationDbi::mapIds(
+    org.Hs.eg.db,
+    keys = ens,
+    column = "SYMBOL",
+    keytype = "ENSEMBL",
+    multiVals = "first"
+  )
+  tpm_sym <- tpm_counts_tumor[!is.na(gene_symbols), , drop = FALSE]
+  rownames(tpm_sym) <- gene_symbols[!is.na(gene_symbols)]
+  tpm_sym <- rowsum(tpm_sym, group = rownames(tpm_sym), reorder = FALSE)
+
+  data("PanCancer.xCell2Ref", package = "xCell2")
+  bp <- if (requireNamespace("BiocParallel", quietly = TRUE)) BiocParallel::SerialParam() else NULL
+  xcell2_scores <- tryCatch({
+    if (is.null(bp)) {
+      xCell2::xCell2Analysis(mix = tpm_sym, xcell2object = PanCancer.xCell2Ref, spillover = TRUE)
+    } else {
+      xCell2::xCell2Analysis(mix = tpm_sym, xcell2object = PanCancer.xCell2Ref, spillover = TRUE, BPPARAM = bp)
+    }
+  }, error = function(e) {
+    message("xCell2 call with PanCancer.xCell2Ref failed; trying package defaults. Error was: ", conditionMessage(e))
+    xCell2::xCell2Analysis(mix = tpm_sym)
+  })
+  saveRDS(xcell2_scores, xf)
+  message("Saved xCell2 scores: ", xf)
+  invisible(TRUE)
+}
+
+gse176078_dir <- function() {
+  x <- tryCatch(params$gse176078_external_dir, error = function(e) NULL)
+  if (is.null(x) || length(x) == 0 || is.na(x) || !nzchar(x)) "data/external/GSE176078" else x
+}
+
+fetch_gse176078_supplementary <- function() {
+  sf <- params$seurat_object_path
+  if (file.exists(sf) && !isTRUE(params$force_rebuild_cache)) return(invisible(TRUE))
+
+  gse_dir <- gse176078_dir()
+  if (dir.exists(gse_dir) && length(list.files(gse_dir, recursive = TRUE, all.files = FALSE)) > 0) {
+    message("Using existing GSE176078 supplementary directory: ", gse_dir)
+    return(invisible(TRUE))
+  }
+
+  if (!isTRUE(params$download_gse176078_if_missing)) {
+    message("Single-cell object not found at ", sf,
+            "; skipping GEO download because params$download_gse176078_if_missing is FALSE.")
+    return(invisible(FALSE))
+  }
+  if (!requireNamespace("GEOquery", quietly = TRUE)) {
+    if (isTRUE(params$install_missing_packages)) ensure_packages("GEOquery", bioc = TRUE)
+    else stop("GEOquery is required to download GSE176078 supplementary files.", call. = FALSE)
+  }
+
+  dir.create("data/external", recursive = TRUE, showWarnings = FALSE)
+  message("Downloading GSE176078 supplementary files from GEO...")
+  GEOquery::getGEOSuppFiles("GSE176078", baseDir = "data/external", makeDirectory = TRUE)
+  if (!dir.exists(gse_dir)) {
+    # GEOquery normally creates data/external/GSE176078; keep this defensive.
+    hits <- list.dirs("data/external", recursive = FALSE, full.names = TRUE)
+    hit <- hits[grepl("GSE176078", basename(hits), ignore.case = TRUE)][1]
+    if (!is.na(hit) && dir.exists(hit)) gse_dir <- hit
+  }
+  message("Downloaded GSE176078 supplementary files under: ", gse_dir)
+  invisible(dir.exists(gse_dir))
+}
+
+decompress_gse176078_files <- function(gse_dir) {
+  if (!dir.exists(gse_dir)) return(character())
+  files <- list.files(gse_dir, recursive = TRUE, full.names = TRUE)
+
+  # Expand archives, but leave simple .gz files in place because Read10X/readr/fread can read them.
+  archive_files <- files[grepl("\\.(tar|tar\\.gz|tgz|zip)$", files, ignore.case = TRUE)]
+  for (ff in archive_files) {
+    marker <- file.path(dirname(ff), paste0(".extracted_", basename(ff), ".done"))
+    if (file.exists(marker) && !isTRUE(params$force_rebuild_cache)) next
+    message("Extracting ", ff)
+    ok <- tryCatch({
+      if (grepl("\\.zip$", ff, ignore.case = TRUE)) {
+        utils::unzip(ff, exdir = dirname(ff))
+      } else {
+        utils::untar(ff, exdir = dirname(ff))
+      }
+      TRUE
+    }, error = function(e) {
+      warning("Could not extract ", ff, ": ", conditionMessage(e))
+      FALSE
+    })
+    if (isTRUE(ok)) writeLines(as.character(Sys.time()), marker)
+  }
+  list.files(gse_dir, recursive = TRUE, full.names = TRUE)
+}
+
+read_table_flexible <- function(path, n_max = Inf) {
+  if (requireNamespace("data.table", quietly = TRUE)) {
+    if (is.infinite(n_max)) {
+      return(as.data.frame(data.table::fread(path, nThread = 1, data.table = FALSE)))
+    }
+    return(as.data.frame(data.table::fread(path, nThread = 1, nrows = n_max, data.table = FALSE)))
+  }
+  sep <- if (grepl("\\.csv(\\.gz)?$", path, ignore.case = TRUE)) "," else "\t"
+  if (is.infinite(n_max)) {
+    return(utils::read.table(path, header = TRUE, sep = sep, quote = "\"", comment.char = "",
+                             check.names = FALSE, stringsAsFactors = FALSE))
+  }
+  utils::read.table(path, header = TRUE, sep = sep, quote = "\"", comment.char = "",
+                    check.names = FALSE, stringsAsFactors = FALSE, nrows = n_max)
+}
+
+find_seurat_object_in_serialized_files <- function(files) {
+  rds_files <- files[grepl("\\.(rds|RDS)$", files)]
+  for (ff in rds_files) {
+    obj <- tryCatch(readRDS(ff), error = function(e) NULL)
+    if (inherits(obj, "Seurat")) {
+      message("Found processed Seurat object in: ", ff)
+      return(obj)
+    }
+  }
+
+  rdata_files <- files[grepl("\\.(rda|RData)$", files, ignore.case = TRUE)]
+  for (ff in rdata_files) {
+    env <- new.env(parent = emptyenv())
+    ok <- tryCatch({ load(ff, envir = env); TRUE }, error = function(e) FALSE)
+    if (!ok) next
+    for (nm in ls(env)) {
+      obj <- get(nm, envir = env)
+      if (inherits(obj, "Seurat")) {
+        message("Found processed Seurat object in: ", ff, " object: ", nm)
+        return(obj)
+      }
+    }
+  }
+  NULL
+}
+
+load_h5ad_as_seurat <- function(files) {
+  h5ad <- files[grepl("\\.h5ad$", files, ignore.case = TRUE)][1]
+  if (is.na(h5ad)) return(NULL)
+  if (!requireNamespace("SeuratDisk", quietly = TRUE)) {
+    message("Found h5ad file but SeuratDisk is not installed; skipping h5ad import: ", h5ad)
+    return(NULL)
+  }
+  h5s <- sub("\\.h5ad$", ".h5seurat", h5ad, ignore.case = TRUE)
+  if (!file.exists(h5s) || isTRUE(params$force_rebuild_cache)) {
+    message("Converting h5ad to h5Seurat: ", h5ad)
+    SeuratDisk::Convert(h5ad, dest = "h5seurat", overwrite = TRUE)
+  }
+  message("Loading h5Seurat object: ", h5s)
+  SeuratDisk::LoadH5Seurat(h5s, assays = "RNA", reductions = NULL, graphs = FALSE, images = FALSE)
+}
+
+load_10x_h5_as_seurat <- function(files) {
+  h5_files <- files[grepl("\\.(h5|hdf5)$", files, ignore.case = TRUE)]
+  if (length(h5_files) == 0) return(NULL)
+  # Avoid h5ad here; handled above.
+  h5_files <- h5_files[!grepl("\\.h5ad$", h5_files, ignore.case = TRUE)]
+  if (length(h5_files) == 0) return(NULL)
+
+  objs <- list()
+  for (ff in h5_files) {
+    message("Trying 10X HDF5 import: ", ff)
+    mat <- tryCatch(Seurat::Read10X_h5(ff), error = function(e) NULL)
+    if (is.null(mat)) next
+    if (is.list(mat)) {
+      nm <- intersect(c("Gene Expression", "RNA"), names(mat))[1]
+      mat <- if (!is.na(nm)) mat[[nm]] else mat[[1]]
+    }
+    sample_id <- tools::file_path_sans_ext(basename(ff))
+    colnames(mat) <- paste(sample_id, colnames(mat), sep = "_")
+    objs[[sample_id]] <- Seurat::CreateSeuratObject(counts = mat, project = sample_id)
+  }
+  if (length(objs) == 0) return(NULL)
+  if (length(objs) == 1) return(objs[[1]])
+  Reduce(function(a, b) merge(a, b), objs)
+}
+
+find_10x_dirs <- function(files) {
+  mtx <- files[grepl("matrix\\.mtx(\\.gz)?$", basename(files), ignore.case = TRUE)]
+  dirs <- unique(dirname(mtx))
+  dirs[vapply(dirs, function(d) {
+    local <- basename(list.files(d, full.names = FALSE))
+    any(grepl("barcodes\\.tsv(\\.gz)?$", local, ignore.case = TRUE)) &&
+      any(grepl("(features|genes)\\.tsv(\\.gz)?$", local, ignore.case = TRUE))
+  }, logical(1))]
+}
+
+load_10x_dirs_as_seurat <- function(files) {
+  dirs <- find_10x_dirs(files)
+  if (length(dirs) == 0) return(NULL)
+  objs <- list()
+  for (dd in dirs) {
+    sample_id <- basename(dd)
+    message("Trying 10X directory import: ", dd)
+    mat <- tryCatch(Seurat::Read10X(data.dir = dd), error = function(e) NULL)
+    if (is.null(mat)) next
+    if (is.list(mat)) {
+      nm <- intersect(c("Gene Expression", "RNA"), names(mat))[1]
+      mat <- if (!is.na(nm)) mat[[nm]] else mat[[1]]
+    }
+    colnames(mat) <- paste(sample_id, colnames(mat), sep = "_")
+    objs[[sample_id]] <- Seurat::CreateSeuratObject(counts = mat, project = sample_id)
+  }
+  if (length(objs) == 0) return(NULL)
+  if (length(objs) == 1) return(objs[[1]])
+  Reduce(function(a, b) merge(a, b), objs)
+}
+
+load_delimited_expression_as_seurat <- function(files) {
+  expr_files <- files[grepl("(count|counts|matrix|expression|expr|data).*\\.(csv|tsv|txt)(\\.gz)?$", basename(files), ignore.case = TRUE)]
+  expr_files <- expr_files[!grepl("(meta|annot|clinical|barcode|feature|gene)", basename(expr_files), ignore.case = TRUE)]
+  if (length(expr_files) == 0) return(NULL)
+
+  # Try the most likely files first, but do not read all huge files if one succeeds.
+  expr_files <- expr_files[order(nchar(basename(expr_files)))]
+  for (ff in expr_files) {
+    message("Trying delimited expression import: ", ff)
+    df <- tryCatch(read_table_flexible(ff), error = function(e) NULL)
+    if (is.null(df) || ncol(df) < 3 || nrow(df) < 100) next
+    gene_col <- names(df)[1]
+    genes <- as.character(df[[gene_col]])
+    if (anyDuplicated(genes)) genes <- make.unique(genes)
+    mat_df <- df[, -1, drop = FALSE]
+    mat <- tryCatch(as.matrix(mat_df), error = function(e) NULL)
+    if (is.null(mat)) next
+    suppressWarnings(storage.mode(mat) <- "numeric")
+    if (sum(is.finite(mat), na.rm = TRUE) == 0) next
+    rownames(mat) <- genes
+    mat[!is.finite(mat)] <- 0
+    return(Seurat::CreateSeuratObject(counts = mat, project = "GSE176078"))
+  }
+  NULL
+}
+
+add_gse176078_metadata <- function(seu, files) {
+  md_files <- files[grepl("(meta|metadata|annot|annotation|cell).*\\.(csv|tsv|txt)(\\.gz)?$", basename(files), ignore.case = TRUE)]
+  md_files <- md_files[!grepl("(matrix|count|expression)", basename(md_files), ignore.case = TRUE)]
+  if (length(md_files) == 0) return(seu)
+
+  for (ff in md_files) {
+    message("Trying metadata import: ", ff)
+    md <- tryCatch(read_table_flexible(ff), error = function(e) NULL)
+    if (is.null(md) || nrow(md) < 10 || ncol(md) < 2) next
+
+    candidate_cols <- names(md)[grepl("barcode|cell|cell_id|cellid|CellID|NAME", names(md), ignore.case = TRUE)]
+    candidate_cols <- unique(c(candidate_cols, names(md)[1]))
+    best_col <- NA_character_; best_n <- 0L
+    for (cc in candidate_cols) {
+      vals <- as.character(md[[cc]])
+      n1 <- sum(vals %in% colnames(seu))
+      n2 <- sum(paste0(basename(dirname(ff)), "_", vals) %in% colnames(seu))
+      n <- max(n1, n2)
+      if (n > best_n) { best_n <- n; best_col <- cc }
+    }
+    if (is.na(best_col) || best_n < 10) next
+
+    cell_ids <- as.character(md[[best_col]])
+    if (sum(cell_ids %in% colnames(seu)) < 10) {
+      prefixed <- paste0(basename(dirname(ff)), "_", cell_ids)
+      if (sum(prefixed %in% colnames(seu)) > sum(cell_ids %in% colnames(seu))) cell_ids <- prefixed
+    }
+    rownames(md) <- make.unique(cell_ids)
+    md[[best_col]] <- NULL
+    md <- md[intersect(rownames(md), colnames(seu)), , drop = FALSE]
+    if (nrow(md) >= 10) {
+      seu <- Seurat::AddMetaData(seu, metadata = md)
+      message("Added metadata from ", ff, " for ", nrow(md), " cells.")
+      break
+    }
+  }
+  seu
+}
+
+standardize_gse176078_annotations <- function(seu) {
+  md <- seu@meta.data
+  if (!"celltype_subset" %in% colnames(md)) {
+    exact_labels <- c("Luminal Progenitors", "Mature Luminal", "Cancer LumA SC", "Basal SC")
+    exact_hit <- NA_character_
+    for (cc in colnames(md)) {
+      vals <- as.character(md[[cc]])
+      if (any(exact_labels %in% vals, na.rm = TRUE)) { exact_hit <- cc; break }
+    }
+    candidates <- c(
+      exact_hit, "celltype_subset", "celltype_sub", "cell_type_subset", "celltype_minor",
+      "cell_type", "celltype", "CellType", "annotation", "major_celltype",
+      "celltype_major", "SCSubtype", "subtype", "cell_type_major"
+    )
+    candidates <- candidates[!is.na(candidates)]
+    ct_col <- candidates[candidates %in% colnames(md)][1]
+    if (!is.na(ct_col)) {
+      seu$celltype_subset <- as.character(md[[ct_col]])
+      message("Standardized GSE176078 cell annotation column to celltype_subset from: ", ct_col)
+    } else {
+      warning("Could not identify the Wu et al. annotation column. Downstream single-cell sections may skip or fail unless celltype_subset is present.")
+    }
+  }
+
+  # Make common slight naming variants compatible with the downstream manuscript tests.
+  if ("celltype_subset" %in% colnames(seu@meta.data)) {
+    x <- as.character(seu$celltype_subset)
+    x <- dplyr::case_when(
+      x %in% c("Luminal progenitors", "Luminal progenitor", "Luminal Progenitor", "LP") ~ "Luminal Progenitors",
+      x %in% c("Mature luminal", "Mature Luminal Cells", "ML") ~ "Mature Luminal",
+      x %in% c("Cancer LumA", "Cancer_LumA_SC", "Cancer LumA", "LumA SC", "Luminal A SC") ~ "Cancer LumA SC",
+      TRUE ~ x
+    )
+    seu$celltype_subset <- x
+  }
+  seu
+}
+
+normalize_gse176078_seurat <- function(seu) {
+  # Ensure a usable normalized RNA data matrix for FetchData().
+  if ("RNA" %in% names(seu@assays)) Seurat::DefaultAssay(seu) <- "RNA"
+  seu <- tryCatch({
+    Seurat::NormalizeData(seu, verbose = FALSE)
+  }, error = function(e) {
+    message("NormalizeData skipped/failed; keeping loaded object as-is. Error: ", conditionMessage(e))
+    seu
+  })
+  seu
+}
+
+build_gse176078_seurat_cache <- function() {
+  sf <- params$seurat_object_path
+  if (file.exists(sf) && !isTRUE(params$force_rebuild_cache)) {
+    message("Using cached GSE176078 Seurat object: ", sf)
+    return(invisible(TRUE))
+  }
+  if (!isTRUE(params$build_gse176078_seurat_if_missing)) {
+    message("GSE176078 Seurat object missing, but params$build_gse176078_seurat_if_missing is FALSE; skipping.")
+    return(invisible(FALSE))
+  }
+  if (!requireNamespace("Seurat", quietly = TRUE)) {
+    if (isTRUE(params$install_missing_packages)) ensure_packages("Seurat", bioc = FALSE)
+    else stop("Seurat is required to reconstruct the GSE176078 object. Install Seurat or knit with params$install_missing_packages = TRUE.", call. = FALSE)
+  }
+
+  ok <- fetch_gse176078_supplementary()
+  if (!isTRUE(ok)) return(invisible(FALSE))
+
+  gse_dir <- gse176078_dir()
+  files <- decompress_gse176078_files(gse_dir)
+  if (length(files) == 0) {
+    stop("No GSE176078 supplementary files found under ", gse_dir, call. = FALSE)
+  }
+
+  message("Reconstructing GSE176078 Seurat object from detected processed files...")
+  seu <- find_seurat_object_in_serialized_files(files)
+  if (is.null(seu)) seu <- load_h5ad_as_seurat(files)
+  if (is.null(seu)) seu <- load_10x_h5_as_seurat(files)
+  if (is.null(seu)) seu <- load_10x_dirs_as_seurat(files)
+  if (is.null(seu)) seu <- load_delimited_expression_as_seurat(files)
+
+  if (is.null(seu)) {
+    stop(
+      "Could not automatically reconstruct a Seurat object from GSE176078 supplementary files.\n",
+      "Supported automatic inputs are: Seurat .rds/.RData, .h5ad with SeuratDisk, 10X .h5, ",
+      "10X matrix.mtx/features/barcodes directories, or delimited gene-by-cell expression matrices.\n",
+      "If the public portal provides a different format, convert it once to ", sf, " and rerun the Rmd.",
+      call. = FALSE
+    )
+  }
+
+  seu <- add_gse176078_metadata(seu, files)
+  seu <- standardize_gse176078_annotations(seu)
+  seu <- normalize_gse176078_seurat(seu)
+
+  dir.create(dirname(sf), recursive = TRUE, showWarnings = FALSE)
+  saveRDS(seu, sf)
+  message("Saved reconstructed GSE176078 Seurat object: ", sf)
+  invisible(TRUE)
+}
+
+have_core <- all(file.exists(unname(core_rds)))
+if ((!have_core || isTRUE(params$force_rebuild_cache)) && isTRUE(params$download_tcga_if_missing)) {
+  build_tcga_brca_cache()
+} else if (!have_core) {
+  stop("Required cached files are missing: ", paste(names(core_rds)[!file.exists(unname(core_rds))], collapse = ", "),
+       "\nSet params$download_tcga_if_missing = TRUE or provide the RDS files under results/rds/.", call. = FALSE)
+} else {
+  cat("Using cached TCGA inputs under results/rds/.\n")
+}
+
+build_xcell2_cache()
+build_gse176078_seurat_cache()
+```
+
 ```{r load_data}
-# ---- Base data (adjust paths as needed) ----
+# ---- Base data built/loaded by reproducible_input_cache ----
 norm_counts       <- readRDS("results/rds/norm_counts.rds")
 sample_meta_tumor <- readRDS("results/rds/sample_meta.rds")
 brca.clin         <- readRDS("results/rds/brca_clin.rds")
@@ -210,8 +841,25 @@ foxc1_df <- data.frame(pam50 = sample_meta_tumor$paper_BRCA_Subtype_PAM50,
 foxc1_df <- foxc1_df[foxc1_df$pam50 %in% c("LumA","LumB","Her2","Basal"), ]
 foxc1_df$pam50 <- factor(foxc1_df$pam50, levels=c("LumA","LumB","Her2","Basal"))
 
-rho_fc <- cor(foxc1_df$foxc1[foxc1_df$pam50=="LumA"],
-              foxc1_df$foxcut[foxc1_df$pam50=="LumA"], method="spearman")
+# ---- FOXCUT--FOXC1 Spearman correlations cited in the text ----
+# exact = FALSE is used because RNA-seq expression contains ties after normalization/log transform.
+foxcut_foxc1_cor <- function(subtype_label) {
+  d <- foxc1_df[foxc1_df$pam50 == subtype_label, c("foxc1", "foxcut")]
+  d <- d[stats::complete.cases(d), ]
+  ct <- suppressWarnings(stats::cor.test(d$foxc1, d$foxcut,
+                                         method = "spearman", exact = FALSE))
+  data.frame(
+    Subtype = subtype_label,
+    N = nrow(d),
+    Spearman_rho = unname(ct$estimate),
+    P_value = ct$p.value,
+    stringsAsFactors = FALSE
+  )
+}
+
+foxcut_foxc1_stats <- do.call(rbind, lapply(c("LumA", "Basal"), foxcut_foxc1_cor))
+rho_fc <- foxcut_foxc1_stats$Spearman_rho[foxcut_foxc1_stats$Subtype == "LumA"]
+p_fc   <- foxcut_foxc1_stats$P_value[foxcut_foxc1_stats$Subtype == "LumA"]
 
 # ---- Distribution descriptors cited in the text (LumA vs Basal FOXC1) ----
 lumA_log2  <- log2(foxc1_all[lumA_idx]  + 1)
@@ -233,6 +881,20 @@ p2 <- ggplot(foxc1_df[foxc1_df$pam50=="LumA",], aes(foxc1, foxcut)) +
   labs(title=paste0("FOXCUT-FOXC1 in LumA (ρ=", round(rho_fc,3), ")"),
        x="FOXC1 log2", y="FOXCUT log2") + theme_bw(base_size=12)
 p1 | p2
+```
+
+```{r s1_foxcut_foxc1_correlation}
+foxcut_foxc1_stats_print <- foxcut_foxc1_stats
+foxcut_foxc1_stats_print$Spearman_rho <- round(foxcut_foxc1_stats_print$Spearman_rho, 3)
+foxcut_foxc1_stats_print$P_value <- format.pval(foxcut_foxc1_stats_print$P_value,
+                                                digits = 3, eps = 1e-300)
+knitr::kable(
+  foxcut_foxc1_stats_print,
+  caption = "FOXCUT--FOXC1 Spearman correlations by PAM50 subtype used for Figure 1 and manuscript text"
+)
+cat(sprintf("FOXCUT--FOXC1 LumA Spearman rho = %.3f, p = %.3g, n = %d\n",
+            rho_fc, p_fc,
+            foxcut_foxc1_stats$N[foxcut_foxc1_stats$Subtype == "LumA"]))
 ```
 
 ```{r s1_groups}
@@ -1181,7 +1843,7 @@ if (any(!is.na(nr$purity))) {
 # External Validation (scRNA-seq GSE176078)
 
 ```{r s9_load, eval=has_seurat}
-sf <- "data/GSE176078_seurat.rds"
+sf <- params$seurat_object_path
 scrna_ok <- file.exists(sf)
 if (scrna_ok) { library(Seurat); seu <- readRDS(sf)
   ct_col <- "celltype_subset" }
@@ -1439,20 +2101,6 @@ knitr::kable(out, row.names=FALSE,
   caption="Abstract-named mediators (MHC class I, xCell2 CD8); HR attenuation is collinearity, not proof of mediation")
 if (is.null(surv_cc$cd8x_z)) cat("xCell2 CD8 step skipped (scores file or CD8 row not found).\n")
 ```
-
-## Validation scope note (GSE176078 retained; GSE81538 omitted per author choice)
-
-This consolidated file keeps the **GSE176078 single-cell** validation (paper Sections N/O, the
-single-cell chunks above) and deliberately does **not** include the GSE81538 bulk-microarray
-replication. Manuscript-text consequence to reconcile (no code change needed here):
-
-- GSE176078 is a single-cell/spatial atlas, so it validates the *hybrid/single-cell structure*,
-  not the bulk FOXC1->immune/stromal correlations.
-- The abstract/Limitations phrasing "independent bulk cohort (GSE176078)" / "independent cohort
-  replication" is therefore inaccurate. Reword to "single-cell validation (GSE176078)" and state
-  that independent **bulk** replication remains pending (or add a bulk cohort such as METABRIC /
-  SCAN-B if a reviewer requires it).
-
 ---
 
 # Review Additions — paper analyses consolidated from the other pipelines
@@ -1460,21 +2108,15 @@ replication. Manuscript-text consequence to reconcile (no code change needed her
 These blocks were present in the figure/mechanism pipelines and correspond to claims made in the
 manuscript, but were not in the master. Each is adapted to this file's objects (`norm_counts`,
 `lumA_idx`, `foxc1_lumA`, `get_ids`/`lookup_id`, the `imm` table, the new GSVA `ssgseaParam` API)
-and guarded so the knit degrades gracefully. NOT knit-tested against data.
+and guarded so the knit degrades gracefully when optional inputs/packages are unavailable.
 
-## [backs Section J] xCell2 score provenance (documentation only)
+## [backs Section J] xCell2 score provenance
 
-```{r add_xcell2_provenance, eval=FALSE}
-# How results/rds/xcell2_scores.rds (loaded in s5_xcell2) was generated. eval=FALSE: this is a
-# record of method, not re-run here. Requires the TPM tumor matrix + the xCell2 package.
-gene_symbols <- mapIds(org.Hs.eg.db, keys = rownames(tpm_counts_tumor),
-                       column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
-tpm_sym <- tpm_counts_tumor; rownames(tpm_sym) <- gene_symbols
-tpm_sym <- tpm_sym[!is.na(rownames(tpm_sym)) & !duplicated(rownames(tpm_sym)), ]
-data("PanCancer.xCell2Ref", package = "xCell2")          # BRCA-optimized ref if available
-xcell2_scores <- xCell2::xCell2Analysis(mix = tpm_sym, xcell2object = PanCancer.xCell2Ref,
-                                        spillover = TRUE, BPPARAM = BiocParallel::SerialParam())
-saveRDS(xcell2_scores, "results/rds/xcell2_scores.rds")
+```{r add_xcell2_provenance}
+cat("xCell2 cache path: results/rds/xcell2_scores.rds\n")
+cat("If absent, this report attempts to rebuild it in the earlier reproducible_input_cache chunk using results/rds/tpm_counts_tumor.rds.\n")
+cat("xCell2 package available:", requireNamespace("xCell2", quietly = TRUE), "\n")
+cat("xCell2 scores available:", file.exists("results/rds/xcell2_scores.rds"), "\n")
 ```
 
 ## [backs Section H.5] Chemokine–myeloid dissociation
@@ -1587,9 +2229,288 @@ if (requireNamespace("ppcor", quietly = TRUE)) {
 }
 ```
 
-```{r add_exploratory_motif_and_scrna, eval=FALSE}
-# (1) FOXC1 motif enrichment in chemokine promoters (JASPAR PWM + Biostrings/genome) and
-# (2) single-cell FOXC1/CCL19 co-expression by cell type, are in chemokine_mechanism_alternatives.Rmd.
-# They need heavy external dependencies (JASPAR2020/TFBSTools/BSgenome; or a loaded Seurat sc_obj)
-# that are out of scope for this consolidated file. See that file's Tests 3-4 for the full code.
+### Optional Test 3: FOXC1 motif enrichment in chemokine promoters
+
+This exploratory test asks whether chemokine promoters contain predicted FOXC1 binding motifs more often than a background set of expressed genes. It is included for repository completeness, but it is **disabled by default** because it requires JASPAR, genome, and promoter-annotation packages. It does not prove direct FOXC1 regulation; it only tests motif compatibility.
+
+```{r exploratory_foxc1_motif_promoters, eval=params$run_foxc1_motif_test}
+# Optional heavy-dependency promoter-motif scan.
+# Set params$run_foxc1_motif_test = TRUE to run.
+
+motif_needed <- c(
+  "JASPAR2020", "TFBSTools", "BSgenome", "BSgenome.Hsapiens.UCSC.hg38",
+  "TxDb.Hsapiens.UCSC.hg38.knownGene", "GenomicFeatures", "GenomicRanges",
+  "GenomeInfoDb", "Biostrings", "org.Hs.eg.db", "AnnotationDbi"
+)
+missing_motif <- motif_needed[!vapply(motif_needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_motif) > 0 && isTRUE(params$install_missing_packages)) {
+  ensure_packages(missing_motif, bioc = TRUE)
+  missing_motif <- motif_needed[!vapply(motif_needed, requireNamespace, logical(1), quietly = TRUE)]
+}
+
+if (length(missing_motif) > 0) {
+  cat("Skipping FOXC1 promoter motif scan; missing package(s): ",
+      paste(missing_motif, collapse = ", "),
+      "\nInstall these packages or knit with params$install_missing_packages = TRUE.\n", sep = "")
+} else {
+  suppressPackageStartupMessages({
+    library(JASPAR2020)
+    library(TFBSTools)
+    library(BSgenome.Hsapiens.UCSC.hg38)
+    library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+    library(GenomicFeatures)
+    library(GenomicRanges)
+    library(GenomeInfoDb)
+    library(Biostrings)
+  })
+
+  dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
+  motif_scan_file <- "results/tables/foxc1_motif_promoter_scan.csv"
+  motif_enrich_file <- "results/tables/foxc1_motif_promoter_enrichment.csv"
+
+  get_jaspar_object <- function() {
+    if (exists("JASPAR2020", envir = asNamespace("JASPAR2020"), inherits = FALSE)) {
+      get("JASPAR2020", envir = asNamespace("JASPAR2020"))
+    } else {
+      JASPAR2020::JASPAR2020
+    }
+  }
+
+  jaspar_db <- get_jaspar_object()
+  pfms <- TFBSTools::getMatrixSet(
+    jaspar_db,
+    opts = list(species = 9606, all_versions = FALSE, collection = "CORE", name = "FOXC1")
+  )
+  if (length(pfms) == 0) stop("No FOXC1 motif found in JASPAR2020 with the selected options.")
+  pfm_names <- vapply(pfms, TFBSTools::name, character(1))
+  pfm_idx <- grep("FOXC1", pfm_names, ignore.case = TRUE)[1]
+  if (is.na(pfm_idx)) pfm_idx <- 1
+  foxc1_pwm <- TFBSTools::toPWM(pfms[[pfm_idx]], type = "prob")
+  cat("Using JASPAR motif:", TFBSTools::name(pfms[[pfm_idx]]), "\n")
+
+  txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene::TxDb.Hsapiens.UCSC.hg38.knownGene
+  genome <- BSgenome.Hsapiens.UCSC.hg38::BSgenome.Hsapiens.UCSC.hg38
+
+  promoter_seqs_for_symbols <- function(symbols) {
+    symbols <- unique(symbols[!is.na(symbols) & nzchar(symbols)])
+    if (length(symbols) == 0) return(Biostrings::DNAStringSet())
+    entrez <- AnnotationDbi::mapIds(
+      org.Hs.eg.db, keys = symbols, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first"
+    )
+    map <- data.frame(symbol = names(entrez), entrez = as.character(entrez), stringsAsFactors = FALSE)
+    map <- map[!is.na(map$entrez) & !duplicated(map$entrez), , drop = FALSE]
+    if (nrow(map) == 0) return(Biostrings::DNAStringSet())
+
+    g <- GenomicFeatures::genes(txdb)
+    map <- map[map$entrez %in% names(g), , drop = FALSE]
+    if (nrow(map) == 0) return(Biostrings::DNAStringSet())
+
+    g <- g[map$entrez]
+    pr <- GenomicRanges::promoters(
+      g,
+      upstream = as.integer(params$promoter_upstream_bp),
+      downstream = as.integer(params$promoter_downstream_bp)
+    )
+    common_seq <- intersect(GenomeInfoDb::seqlevels(pr), GenomeInfoDb::seqlevels(genome))
+    pr <- GenomeInfoDb::keepSeqlevels(pr, common_seq, pruning.mode = "coarse")
+    GenomeInfoDb::seqinfo(pr) <- GenomeInfoDb::seqinfo(genome)[GenomeInfoDb::seqlevels(pr)]
+    pr <- GenomicRanges::trim(pr)
+    if (length(pr) == 0) return(Biostrings::DNAStringSet())
+
+    seqs <- BSgenome::getSeq(genome, pr)
+    symbol_by_entrez <- setNames(map$symbol, map$entrez)
+    names(seqs) <- unname(symbol_by_entrez[names(pr)])
+    seqs[!duplicated(names(seqs))]
+  }
+
+  chemokine_sets <- list(
+    TLS_lymphoid = c("CCL19", "CCL21", "CXCL13"),
+    T_cell_recruiting = c("CXCL9", "CXCL10", "CCL5", "CCL4"),
+    Myeloid_recruiting = c("CCL2", "CXCL1", "CXCL8", "CXCL12")
+  )
+
+  target_symbols <- unique(unlist(chemokine_sets))
+  all_symbols <- unique(na.omit(unname(gene_id_map)))
+  all_symbols <- setdiff(all_symbols, target_symbols)
+  set.seed(1)
+  bg_n <- min(as.integer(params$motif_background_genes), length(all_symbols))
+  background_symbols <- sample(all_symbols, bg_n)
+
+  scan_design <- dplyr::bind_rows(
+    lapply(names(chemokine_sets), function(nm) {
+      data.frame(set = nm, symbol = chemokine_sets[[nm]], stringsAsFactors = FALSE)
+    }),
+    data.frame(set = "background_expressed", symbol = background_symbols, stringsAsFactors = FALSE)
+  )
+
+  promoter_seqs <- promoter_seqs_for_symbols(unique(scan_design$symbol))
+  scan_design <- scan_design[scan_design$symbol %in% names(promoter_seqs), , drop = FALSE]
+
+  site_counts <- vapply(names(promoter_seqs), function(sym) {
+    sites <- TFBSTools::searchSeq(
+      foxc1_pwm,
+      promoter_seqs[[sym]],
+      min.score = params$foxc1_motif_min_score,
+      strand = "*"
+    )
+    length(sites)
+  }, integer(1))
+
+  scan_design$foxc1_motif_count <- unname(site_counts[scan_design$symbol])
+  scan_design$foxc1_motif_present <- scan_design$foxc1_motif_count > 0
+  readr::write_csv(scan_design, motif_scan_file)
+
+  enrich <- dplyr::bind_rows(lapply(setdiff(unique(scan_design$set), "background_expressed"), function(st) {
+    a <- sum(scan_design$set == st & scan_design$foxc1_motif_present)
+    b <- sum(scan_design$set == st & !scan_design$foxc1_motif_present)
+    c <- sum(scan_design$set == "background_expressed" & scan_design$foxc1_motif_present)
+    d <- sum(scan_design$set == "background_expressed" & !scan_design$foxc1_motif_present)
+    ft <- fisher.test(matrix(c(a, b, c, d), nrow = 2, byrow = TRUE))
+    data.frame(
+      chemokine_set = st,
+      target_genes_scanned = a + b,
+      target_motif_positive = a,
+      background_genes_scanned = c + d,
+      background_motif_positive = c,
+      odds_ratio = unname(ft$estimate),
+      p_value = ft$p.value,
+      stringsAsFactors = FALSE
+    )
+  }))
+  enrich$fdr <- p.adjust(enrich$p_value, method = "BH")
+  readr::write_csv(enrich, motif_enrich_file)
+
+  knitr::kable(scan_design %>% dplyr::filter(set != "background_expressed"),
+               caption = "FOXC1 motif scan in selected chemokine promoters")
+  knitr::kable(enrich,
+               digits = 3,
+               caption = "Exploratory FOXC1 motif enrichment in chemokine promoters vs expressed-gene background")
+  cat("Saved motif scan:", motif_scan_file, "\n")
+  cat("Saved enrichment table:", motif_enrich_file, "\n")
+}
+```
+
+### Optional Test 4: single-cell FOXC1/CCL19 co-expression by cell type
+
+This exploratory test asks whether \textit{FOXC1} and \textit{CCL19} are co-detected in the same single cells, stratified by Wu et al. cell-type annotations when a processed Seurat object is available. It is disabled by default because it requires `params$seurat_object_path` to point to a processed Seurat object.
+
+```{r exploratory_scrna_foxc1_ccl19_by_celltype, eval=params$run_scrna_ccl19_test}
+# Optional single-cell FOXC1/CCL19 co-expression scan.
+# Set params$run_scrna_ccl19_test = TRUE and params$seurat_object_path to a processed Seurat object.
+
+sc_needed <- c("Seurat", "dplyr", "ggplot2", "readr")
+missing_sc <- sc_needed[!vapply(sc_needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_sc) > 0 && isTRUE(params$install_missing_packages)) {
+  ensure_packages(missing_sc, bioc = FALSE)
+  missing_sc <- sc_needed[!vapply(sc_needed, requireNamespace, logical(1), quietly = TRUE)]
+}
+
+if (length(missing_sc) > 0) {
+  cat("Skipping single-cell FOXC1/CCL19 test; missing package(s): ",
+      paste(missing_sc, collapse = ", "),
+      "\nInstall these packages or knit with params$install_missing_packages = TRUE.\n", sep = "")
+} else if (!file.exists(params$seurat_object_path)) {
+  cat("Skipping single-cell FOXC1/CCL19 test; Seurat object not found at: ",
+      params$seurat_object_path, "\n", sep = "")
+} else {
+  suppressPackageStartupMessages({
+    library(Seurat)
+    library(dplyr)
+    library(ggplot2)
+  })
+
+  dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
+  dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+
+  sc_obj <- readRDS(params$seurat_object_path)
+  md <- sc_obj@meta.data
+  ct_candidates <- c(
+    "celltype_subset", "cell_type", "celltype", "CellType", "annotation",
+    "major_celltype", "SCSubtype", "subtype", "cell_type_major"
+  )
+  ct_col <- ct_candidates[ct_candidates %in% colnames(md)][1]
+  if (is.na(ct_col)) {
+    stop("Could not identify a cell-type metadata column. Add one of: ",
+         paste(ct_candidates, collapse = ", "), call. = FALSE)
+  }
+  if (!all(c("FOXC1", "CCL19") %in% rownames(sc_obj))) {
+    missing_genes <- setdiff(c("FOXC1", "CCL19"), rownames(sc_obj))
+    cat("Skipping single-cell FOXC1/CCL19 test; missing gene(s) in Seurat object: ",
+        paste(missing_genes, collapse = ", "), "\n", sep = "")
+  } else {
+    fd <- Seurat::FetchData(sc_obj, vars = c("FOXC1", "CCL19"))
+    fd$cell_type <- as.character(md[[ct_col]])
+    fd$FOXC1_pos <- fd$FOXC1 > 0
+    fd$CCL19_pos <- fd$CCL19 > 0
+
+    fisher_one <- function(d) {
+      tab <- table(
+        factor(d$FOXC1_pos, levels = c(FALSE, TRUE)),
+        factor(d$CCL19_pos, levels = c(FALSE, TRUE))
+      )
+      if (sum(tab) < 20 || any(rowSums(tab) == 0) || any(colSums(tab) == 0)) {
+        return(c(odds_ratio = NA_real_, p_value = NA_real_))
+      }
+      ft <- fisher.test(tab)
+      c(odds_ratio = unname(ft$estimate), p_value = ft$p.value)
+    }
+
+    coexpr_by_type <- dplyr::bind_rows(lapply(split(fd, fd$cell_type), function(d) {
+      ft <- fisher_one(d)
+      data.frame(
+        cell_type = unique(d$cell_type)[1],
+        n_cells = nrow(d),
+        foxc1_detected_pct = 100 * mean(d$FOXC1_pos),
+        ccl19_detected_pct = 100 * mean(d$CCL19_pos),
+        co_detected_pct = 100 * mean(d$FOXC1_pos & d$CCL19_pos),
+        ccl19_among_foxc1_pos_pct = ifelse(sum(d$FOXC1_pos) > 0,
+                                           100 * mean(d$CCL19_pos[d$FOXC1_pos]), NA_real_),
+        fisher_or = ft["odds_ratio"],
+        fisher_p = ft["p_value"],
+        stringsAsFactors = FALSE
+      )
+    })) %>%
+      dplyr::arrange(dplyr::desc(co_detected_pct), dplyr::desc(n_cells))
+    coexpr_by_type$fdr <- p.adjust(coexpr_by_type$fisher_p, method = "BH")
+
+    out_csv <- "results/tables/scrna_foxc1_ccl19_coexpression_by_cell_type.csv"
+    readr::write_csv(coexpr_by_type, out_csv)
+
+    p_co <- coexpr_by_type %>%
+      dplyr::filter(n_cells >= 20) %>%
+      ggplot(aes(co_detected_pct, reorder(cell_type, co_detected_pct))) +
+      geom_col() +
+      labs(
+        x = "FOXC1/CCL19 co-detected cells (%)",
+        y = NULL,
+        title = "Single-cell FOXC1/CCL19 co-detection by cell type"
+      ) +
+      theme_minimal(base_size = 12)
+    print(p_co)
+    ggsave("results/figures/scrna_foxc1_ccl19_coexpression_by_cell_type.pdf",
+           p_co, width = 8, height = 6)
+
+    knitr::kable(coexpr_by_type,
+                 digits = 3,
+                 caption = "Exploratory single-cell FOXC1/CCL19 co-expression by cell type")
+    cat("Saved single-cell co-expression table:", out_csv, "\n")
+    cat("Interpretation note: co-detection supports cellular-source plausibility only; it does not prove direct FOXC1 regulation of CCL19.\n")
+  }
+}
+```
+
+---
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "session_info.txt")
+```
+
+# Code and Data Availability Template
+
+```{r code_availability_text, results='asis'}
+cat(sprintf("Code used to generate this analysis report and the manuscript figures is available at: %s\n\n", repo_url))
+cat("Large public datasets are not committed directly to the repository. The R Markdown report rebuilds TCGA-BRCA-derived expression, clinical, subtype, tumor-purity, and xCell2-derived objects when cached files are absent and the corresponding parameters are enabled. The proposed FOXCUT/FOXC1-centered model is supported by observational bulk and single-cell analyses, but requires independent spatial, longitudinal, treatment-annotated, or perturbational validation.\n")
 ```
