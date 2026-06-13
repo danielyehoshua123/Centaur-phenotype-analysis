@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+title: "Centaur Phenotype Analysis"
+message: "If you use this code or analysis, please cite this repository."
+authors:
+  - family-names: Yehoshua
+    given-names: Daniel E.
+date-released: 2026-06-13
+version: 1.0.0
+repository-code: "https://github.com/danielyehoshua123/Centaur-phenotype-analysis"
